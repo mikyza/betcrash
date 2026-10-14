@@ -8,3 +8,13 @@ out
 *.tsbuildinfo
 .idea
 .DS_Store
+
+.env
+.env.*
+!.env.example
+node_modules
+.next
+dist
+*.bak
+*.pre-payhero
+*.pre-patch
