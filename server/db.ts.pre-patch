@@ -1,0 +1,14 @@
+import mongoose from 'mongoose';
+import { env } from './env';
+import { logger } from './logger';
+
+export async function connectDb() {
+  mongoose.set('strictQuery', true);
+  await mongoose.connect(env.MONGODB_URI, { dbName: env.MONGODB_DB, maxPoolSize: 50, serverSelectionTimeoutMS: 10000 });
+  // Transactions need a replica set; fail loudly at boot, not at the first bet.
+  const hello = await mongoose.connection.db!.admin().command({ hello: 1 });
+  if (!hello.setName) {
+    throw new Error('MongoDB is not a replica set. Transactions (wallet safety) require one - use Atlas or `--replSet rs0`.');
+  }
+  logger.info('MongoDB connected (replica set %s)', hello.setName);
+}

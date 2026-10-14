@@ -1,0 +1,127 @@
+import mongoose, { Schema, InferSchemaType } from 'mongoose';
+
+const opts = { timestamps: true, versionKey: false } as const;
+
+const userSchema = new Schema({
+  username: { type: String, required: true, unique: true, trim: true, minlength: 3, maxlength: 20, match: /^[A-Za-z0-9_]+$/ },
+  usernameLower: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  passwordHash: { type: String, required: true, select: false },
+  tokenVersion: { type: Number, default: 0 }, // bump to revoke all issued JWTs (logout / ban / password change)
+  role: { type: String, enum: ['user', 'moderator', 'admin'], default: 'user', index: true },
+  status: { type: String, enum: ['active', 'banned'], default: 'active', index: true },
+  balance: { type: Number, default: 0, min: 0 }, // minor units, integer
+  currency: { type: String, default: 'KES' },
+  avatar: { type: String, default: '' },
+  phone: { type: String }, // last M-Pesa number used (254XXXXXXXXX)
+  totalDeposits: { type: Number, default: 0 },
+  totalWithdrawals: { type: Number, default: 0 },
+  acceptedTermsAt: { type: Date },
+  lastSeen: { type: Date },
+  lastIp: { type: String },
+}, opts);
+
+const gameSchema = new Schema({
+  gameNumber: { type: Number, required: true, unique: true },
+  status: { type: String, enum: ['betting', 'playing', 'crashed', 'voided'], default: 'betting', index: true },
+  serverSeedHash: { type: String, required: true }, // commitment (= previous round's revealed seed)
+  serverSeed: { type: String }, // revealed only after crash
+  clientSeed: { type: String, required: true },
+  crashPoint: { type: Number }, // set at crash time only (never written while round is live)
+  totalBets: { type: Number, default: 0 },
+  totalWagered: { type: Number, default: 0 }, // minor
+  totalPayout: { type: Number, default: 0 }, // minor
+  houseProfit: { type: Number, default: 0 }, // minor
+  startedAt: { type: Date, default: Date.now },
+  endedAt: { type: Date },
+}, opts);
+
+const betSchema = new Schema({
+  game: { type: Schema.Types.ObjectId, ref: 'Game', required: true, index: true },
+  gameNumber: { type: Number, required: true },
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  username: { type: String, required: true },
+  avatar: { type: String, default: '' },
+  betType: { type: String, enum: ['first', 'second'], required: true },
+  amount: { type: Number, required: true }, // minor
+  currency: { type: String, required: true },
+  autoCashOut: { type: Number, default: null },
+  status: { type: String, enum: ['active', 'cashed_out', 'lost', 'refunded'], default: 'active', index: true },
+  cashOutAt: { type: Number, default: null },
+  payout: { type: Number, default: 0 }, // minor
+}, opts);
+betSchema.index({ game: 1, user: 1, betType: 1 }, { unique: true }); // one bet per slot per round - DB-enforced
+betSchema.index({ user: 1, createdAt: -1 });
+betSchema.index({ game: 1, status: 1 });
+betSchema.index({ status: 1, payout: -1 });
+
+// Append-only ledger. balanceAfter lets you audit/reconcile any user at any point.
+const txSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  type: { type: String, enum: ['deposit', 'withdrawal', 'withdrawal_refund', 'bet', 'win', 'bet_refund', 'adjustment'], required: true, index: true },
+  amount: { type: Number, required: true }, // signed minor units: negative = debit
+  balanceAfter: { type: Number, required: true },
+  currency: { type: String, required: true },
+  ref: { type: String, index: true }, // bet id / payment id / withdrawal id
+  meta: { type: Schema.Types.Mixed },
+}, opts);
+txSchema.index({ user: 1, createdAt: -1 });
+txSchema.index({ type: 1, ref: 1 }, { unique: true, partialFilterExpression: { ref: { $type: 'string' } } }); // idempotency: same payout/deposit can never post twice
+
+const paymentSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  provider: { type: String, enum: ['payhero'], default: 'payhero' },
+  externalReference: { type: String, required: true, unique: true }, // our id, sent to PayHero
+  payheroReference: { type: String, index: true },
+  checkoutRequestId: { type: String, index: true },
+  phone: { type: String, required: true },
+  amount: { type: Number, required: true }, // minor
+  currency: { type: String, required: true },
+  status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending', index: true },
+  mpesaReceipt: { type: String, sparse: true, unique: true }, // one M-Pesa receipt can only ever credit once
+  failureReason: String,
+}, opts);
+paymentSchema.index({ status: 1, createdAt: 1 });
+
+const withdrawalSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  amount: { type: Number, required: true }, // minor, already debited from balance (held)
+  currency: { type: String, required: true },
+  method: { type: String, default: 'M-Pesa' },
+  accountDetails: { type: String, required: true }, // 254XXXXXXXXX
+  // pending -> (admin approves) processing -> approved (paid) | failed (refunded);  pending -> rejected (refunded)
+  status: { type: String, enum: ['pending', 'processing', 'approved', 'rejected', 'failed'], default: 'pending', index: true },
+  adminNote: String,
+  payoutReference: String,
+  mpesaReceipt: String,
+  processedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  processedAt: Date,
+}, opts);
+
+const chatSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  username: String,
+  avatar: String,
+  message: { type: String, maxlength: 500 },
+  type: { type: String, enum: ['text', 'gif'], default: 'text' },
+  likes: { type: [String], default: [] },
+}, opts);
+chatSchema.index({ createdAt: -1 });
+chatSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 3600 }); // chat history auto-expires after 30 days
+
+const auditSchema = new Schema({
+  actor: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  action: { type: String, required: true },
+  target: String,
+  meta: Schema.Types.Mixed,
+}, opts);
+
+export const User = mongoose.model('User', userSchema);
+export const Game = mongoose.model('Game', gameSchema);
+export const Bet = mongoose.model('Bet', betSchema);
+export const Transaction = mongoose.model('Transaction', txSchema);
+export const Payment = mongoose.model('Payment', paymentSchema);
+export const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
+export const ChatMessage = mongoose.model('ChatMessage', chatSchema);
+export const AuditLog = mongoose.model('AuditLog', auditSchema);
+export type UserDoc = InferSchemaType<typeof userSchema> & { _id: mongoose.Types.ObjectId };

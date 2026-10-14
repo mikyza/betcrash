@@ -1,0 +1,48 @@
+import { randomUUID } from 'crypto';
+import mongoose from 'mongoose';
+import { logger } from './logger';
+
+const LEASE_ID = 'engine';
+const TTL_MS = 30_000;
+const RENEW_MS = 10_000;
+const owner = randomUUID();
+let timer: NodeJS.Timeout | undefined;
+
+const col = () => mongoose.connection.collection('leases');
+
+async function tryAcquire(): Promise<boolean> {
+  const now = new Date();
+  try {
+    await col().updateOne(
+      { _id: LEASE_ID as any, $or: [{ owner }, { expiresAt: { $lt: now } }] },
+      { $set: { owner, expiresAt: new Date(now.getTime() + TTL_MS) } },
+      { upsert: true },
+    );
+    return true;
+  } catch (e: any) {
+    if (e?.code === 11000) return false; // another live holder
+    throw e;
+  }
+}
+
+export async function acquireEngineLease(): Promise<void> {
+  while (!(await tryAcquire())) {
+    logger.warn('engine lease held by another instance, waiting as standby');
+    await new Promise((r) => setTimeout(r, RENEW_MS));
+  }
+  logger.info({ owner }, 'engine lease acquired');
+  timer = setInterval(async () => {
+    try {
+      if (!(await tryAcquire())) throw new Error('lease lost');
+    } catch (err) {
+      logger.fatal({ err }, 'engine lease renewal failed - exiting');
+      process.exit(1);
+    }
+  }, RENEW_MS);
+  timer.unref();
+}
+
+export async function releaseEngineLease(): Promise<void> {
+  if (timer) clearInterval(timer);
+  await col().deleteOne({ _id: LEASE_ID as any, owner });
+}

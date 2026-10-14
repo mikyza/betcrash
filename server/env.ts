@@ -1,0 +1,54 @@
+import { z } from 'zod';
+
+const schema = z.object({
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  PORT: z.coerce.number().default(3000),
+  HOST: z.string().default('0.0.0.0'),
+  PUBLIC_ORIGIN: z.string().url(), // e.g. https://play.example.com (used for CORS + socket origin)
+
+  MONGODB_URI: z.string().min(1), // MUST be a replica set (Atlas or rs0) - transactions are required
+  MONGODB_DB: z.string().default('aviator'),
+  REDIS_URL: z.string().optional(), // optional: only needed to scale Socket.IO across several web instances
+
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 chars'),
+  JWT_EXPIRES_IN: z.string().default('12h'),
+
+  // Provably fair
+  FAIR_CHAIN_ROOT: z.string().regex(/^[0-9a-f]{64}$/i, 'FAIR_CHAIN_ROOT must be 64 hex chars (keep secret!)'),
+  FAIR_CHAIN_LENGTH: z.coerce.number().int().min(1000).default(1_000_000),
+  FAIR_CLIENT_SEED: z.string().min(8), // public salt, published in /games/fairness
+  HOUSE_EDGE_PERCENT: z.coerce.number().min(0.5).max(30).default(20),
+
+  // Game rules (major currency units)
+  BETTING_MS: z.coerce.number().default(7000),
+  CRASH_PAUSE_MS: z.coerce.number().default(3500),
+  MIN_BET: z.coerce.number().positive().default(10),
+  MAX_BET: z.coerce.number().positive().default(100000),
+  MAX_MULTIPLIER: z.coerce.number().default(1000),
+  MAX_PAYOUT: z.coerce.number().positive().default(500000), // max win per single bet (currency units); bet is auto-cashed-out at this cap
+  DEFAULT_CURRENCY: z.string().length(3).default('KES'),
+
+  // Payments: PayHero (M-Pesa STK push in, B2C out)
+  PAYHERO_API_USERNAME: z.string().min(1),
+  PAYHERO_API_PASSWORD: z.string().min(1),
+  PAYHERO_CHANNEL_ID: z.coerce.number().int(), // channel used for STK push (C2B)
+  PAYHERO_PAYOUT_CHANNEL_ID: z.coerce.number().int().optional(), // payments-wallet channel for B2C; defaults to PAYHERO_CHANNEL_ID
+  PAYHERO_CALLBACK_SECRET: z.string().min(32), // secret path segment of the callback URLs
+  PAYHERO_VERIFY_WITH_API: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  MIN_DEPOSIT: z.coerce.number().positive().default(10),
+  MAX_DEPOSIT: z.coerce.number().default(150000),
+  MIN_WITHDRAWAL: z.coerce.number().default(100),
+  MAX_WITHDRAWAL: z.coerce.number().default(150000),
+
+  // Bootstrap first admin (only used by `npm run create-admin`)
+  ADMIN_EMAIL: z.string().email().optional(),
+  ADMIN_PASSWORD: z.string().min(12).optional(),
+});
+
+const parsed = schema.safeParse(process.env);
+if (!parsed.success) {
+  console.error('Invalid environment configuration:\n', parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+export const env = parsed.data;
+export const isProd = env.NODE_ENV === 'production';

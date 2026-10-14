@@ -1,0 +1,143 @@
+import { Router, type NextFunction, type Request, type Response } from 'express';
+import { Types } from 'mongoose';
+import { z } from 'zod';
+import { AppError, toMajor } from '../money';
+import { AuditLog, Bet, Game, Payment, User, Withdrawal } from '../models';
+import { AuthedRequest, requireAuth, requireRole } from '../auth';
+import { credit, hooks, inTransaction } from '../wallet';
+import { b2cPayout } from '../payhero';
+import { finishWithdrawal, settleDeposit } from './payments';
+import type { GameEngine } from '../engine';
+
+const ok = (res: Response, data: unknown) => res.json({ success: true, data });
+const wrap = (fn: (req: AuthedRequest, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => fn(req as AuthedRequest, res).catch(next);
+const oid = (v: string) => { if (!Types.ObjectId.isValid(v)) throw new AppError('Invalid id', 422); return v; };
+const pageOf = (q: Request['query']) => { const limit = Math.min(100, Math.max(1, Number(q.limit) || 20)); const page = Math.max(1, Number(q.page) || 1); return { limit, skip: (page - 1) * limit }; };
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+export function adminRouter(engine: GameEngine) {
+  const r = Router();
+  r.use(requireAuth, requireRole('admin'));
+  const audit = (req: AuthedRequest, action: string, target: string, meta?: object) => AuditLog.create({ actor: req.auth!.id, action, target, meta });
+
+  r.get('/stats', wrap(async (_req, res) => {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const [totalUsers, activeUsers, totalGames, todayAgg, pend] = await Promise.all([
+      User.countDocuments(), User.countDocuments({ lastSeen: { $gte: new Date(Date.now() - 15 * 60_000) } }), Game.countDocuments({ status: 'crashed' }),
+      Game.aggregate([{ $match: { status: 'crashed', endedAt: { $gte: today } } }, { $group: { _id: null, profit: { $sum: '$houseProfit' }, bets: { $sum: '$totalBets' } } }]),
+      Withdrawal.aggregate([{ $match: { status: 'pending' } }, { $group: { _id: null, n: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
+    ]);
+    ok(res, { totalUsers, activeUsers, totalGames, activeGame: engine.live, houseProfitToday: toMajor(todayAgg[0]?.profit ?? 0), totalBetsToday: todayAgg[0]?.bets ?? 0, pendingWithdrawals: pend[0]?.n ?? 0, pendingAmount: toMajor(pend[0]?.amount ?? 0) });
+  }));
+
+  r.get('/games', wrap(async (req, res) => {
+    const { limit, skip } = pageOf(req.query);
+    const [rows, total] = await Promise.all([Game.find({ status: { $in: ['crashed', 'voided'] } }).sort({ gameNumber: -1 }).skip(skip).limit(limit), Game.countDocuments({ status: { $in: ['crashed', 'voided'] } })]);
+    const counts = await Bet.aggregate([{ $match: { game: { $in: rows.map((g) => g._id) } } }, { $group: { _id: '$game', players: { $addToSet: '$user' } } }]);
+    const players = new Map(counts.map((c) => [String(c._id), c.players.length]));
+    ok(res, { total, items: rows.map((g) => ({ id: String(g._id), gameNumber: g.gameNumber, crashPoint: g.crashPoint, serverSeed: g.serverSeed, serverSeedHash: g.serverSeedHash, clientSeed: g.clientSeed, totalBets: g.totalBets, totalWagered: toMajor(g.totalWagered), totalPayout: toMajor(g.totalPayout), houseProfit: toMajor(g.houseProfit), activePlayers: players.get(String(g._id)) ?? 0, status: g.status, startedAt: g.startedAt, endedAt: g.endedAt })) });
+  }));
+
+  r.get('/users', wrap(async (req, res) => {
+    const { limit, skip } = pageOf(req.query);
+    const q = typeof req.query.search === 'string' && req.query.search.trim() ? new RegExp(escapeRe(req.query.search.trim().slice(0, 40)), 'i') : null;
+    const filter = q ? { $or: [{ username: q }, { email: q }] } : {};
+    const [rows, total] = await Promise.all([User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit), User.countDocuments(filter)]);
+    ok(res, { total, items: rows.map((u) => ({ id: String(u._id), username: u.username, email: u.email, balance: toMajor(u.balance), totalDeposits: toMajor(u.totalDeposits), totalWithdrawals: toMajor(u.totalWithdrawals), role: u.role, status: u.status, createdAt: u.createdAt, lastSeen: u.lastSeen })) });
+  }));
+
+  const setStatus = (status: 'active' | 'banned') => wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    if (id === req.auth!.id) throw new AppError('You cannot change your own status');
+    const u = await User.findByIdAndUpdate(id, { status, ...(status === 'banned' ? { $inc: { tokenVersion: 1 } } : {}) }, { new: true });
+    if (!u) throw new AppError('User not found', 404);
+    if (status === 'banned') engine.kickUser(id);
+    await audit(req, status === 'banned' ? 'user.ban' : 'user.unban', id);
+    ok(res, { id, status });
+  });
+  r.patch('/users/:id/ban', setStatus('banned'));
+  r.patch('/users/:id/unban', setStatus('active'));
+  r.patch('/users/:id/role', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const b = z.object({ role: z.enum(['user', 'moderator', 'admin']) }).parse(req.body);
+    if (id === req.auth!.id) throw new AppError('You cannot change your own role');
+    const u = await User.findByIdAndUpdate(id, { role: b.role, $inc: { tokenVersion: 1 } }, { new: true });
+    if (!u) throw new AppError('User not found', 404);
+    engine.kickUser(id);
+    await audit(req, 'user.role', id, { role: b.role });
+    ok(res, { id, role: b.role });
+  }));
+
+  r.get('/withdrawals', wrap(async (req, res) => {
+    const status = ['pending', 'processing', 'approved', 'rejected', 'failed'].includes(String(req.query.status)) ? String(req.query.status) : undefined;
+    const rows = await Withdrawal.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).populate<{ user: { _id: Types.ObjectId; username: string; email: string } }>('user', 'username email');
+    ok(res, { items: rows.map((w) => ({ id: String(w._id), userId: String(w.user._id), username: w.user.username, email: w.user.email, amount: toMajor(w.amount), currency: w.currency, method: w.method, accountDetails: w.accountDetails, status: w.status, adminNote: w.adminNote, createdAt: w.createdAt, processedAt: w.processedAt })) });
+  }));
+
+  // ---- deposits: manual reconciliation (callback lost / PayHero status endpoint unavailable) ----
+  r.get('/payments', wrap(async (req, res) => {
+    const status = ['pending', 'paid', 'failed'].includes(String(req.query.status)) ? String(req.query.status) : undefined;
+    const rows = await Payment.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).populate<{ user: { _id: Types.ObjectId; username: string } }>('user', 'username');
+    ok(res, { items: rows.map((p) => ({ id: String(p._id), userId: String(p.user._id), username: p.user.username, phone: p.phone, amount: toMajor(p.amount), currency: p.currency, status: p.status, reference: p.payheroReference, receipt: p.mpesaReceipt, failureReason: p.failureReason, createdAt: p.createdAt })) });
+  }));
+  // Credit only after you have SEEN the money in the PayHero dashboard / M-Pesa statement. The receipt must be unique.
+  r.patch('/payments/:id/credit', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const b = z.object({ receipt: z.string().trim().min(6, 'Enter the M-Pesa receipt code').max(30) }).parse(req.body ?? {});
+    if (await Payment.exists({ mpesaReceipt: b.receipt })) throw new AppError('That M-Pesa receipt was already used', 409);
+    await Payment.updateOne({ _id: id, status: 'failed' }, { status: 'pending' }); // allow rescuing a payment wrongly marked failed
+    if (!(await settleDeposit(id, b.receipt.toUpperCase()))) throw new AppError('Payment is not pending', 409);
+    await audit(req, 'payment.credit', id, b); ok(res, { id, status: 'paid' });
+  }));
+  r.patch('/payments/:id/fail', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const u = await Payment.updateOne({ _id: id, status: 'pending' }, { status: 'failed', failureReason: 'marked failed by admin' });
+    if (u.modifiedCount !== 1) throw new AppError('Payment is not pending', 409);
+    await audit(req, 'payment.fail', id); ok(res, { id, status: 'failed' });
+  }));
+
+  // Approve = send the money via PayHero B2C. Status goes pending -> processing -> approved (when PayHero confirms) | failed (refunded).
+  r.patch('/withdrawals/:id/approve', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const note = z.object({ adminNote: z.string().max(300).optional() }).parse(req.body ?? {}).adminNote;
+    const ref = `wd_${id}`;
+    const w = await Withdrawal.findOneAndUpdate({ _id: id, status: 'pending' }, { status: 'processing', payoutReference: ref, adminNote: note, processedBy: req.auth!.id, processedAt: new Date() }, { new: true });
+    if (!w) throw new AppError('Withdrawal is not pending', 409);
+    try {
+      await b2cPayout({ amount: toMajor(w.amount), phone: w.accountDetails, externalReference: ref });
+    } catch (e) {
+      await Withdrawal.updateOne({ _id: id, status: 'processing' }, { status: 'pending' }); // payout never left: allow retry
+      throw e;
+    }
+    await audit(req, 'withdrawal.approve', id, { note });
+    ok(res, { id, status: 'processing' });
+  }));
+
+  r.patch('/withdrawals/:id/reject', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const note = z.object({ adminNote: z.string().max(300).optional() }).parse(req.body ?? {}).adminNote;
+    const refunded = await inTransaction(async (s) => {
+      const w = await Withdrawal.findOneAndUpdate({ _id: id, status: 'pending' }, { status: 'rejected', adminNote: note, processedBy: req.auth!.id, processedAt: new Date() }, { new: true, session: s });
+      if (!w) throw new AppError('Withdrawal is not pending', 409);
+      return { user: String(w.user), balance: await credit(s, w.user, w.amount, 'withdrawal_refund', String(w._id)) };
+    });
+    hooks.onBalance(refunded.user, refunded.balance);
+    await audit(req, 'withdrawal.reject', id, { note });
+    ok(res, { id, status: 'rejected' });
+  }));
+
+  // For a payout stuck in `processing` (callback lost): confirm in your PayHero dashboard, then resolve it here.
+  r.patch('/withdrawals/:id/mark-paid', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const b = z.object({ receipt: z.string().max(40).optional(), adminNote: z.string().max(300).optional() }).parse(req.body ?? {});
+    if (!(await finishWithdrawal(id, 'paid', { receipt: b.receipt, note: b.adminNote, by: req.auth!.id }))) throw new AppError('Withdrawal is not processing', 409);
+    await audit(req, 'withdrawal.mark-paid', id, b); ok(res, { id, status: 'approved' });
+  }));
+  r.patch('/withdrawals/:id/mark-failed', wrap(async (req, res) => {
+    const id = oid(String(req.params.id));
+    const b = z.object({ adminNote: z.string().max(300).optional() }).parse(req.body ?? {});
+    if (!(await finishWithdrawal(id, 'failed', { note: b.adminNote, by: req.auth!.id }))) throw new AppError('Withdrawal is not processing', 409);
+    await audit(req, 'withdrawal.mark-failed', id, b); ok(res, { id, status: 'failed' });
+  }));
+  return r;
+}

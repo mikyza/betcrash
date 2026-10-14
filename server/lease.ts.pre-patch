@@ -1,0 +1,32 @@
+import { randomUUID } from 'crypto';
+import mongoose from 'mongoose';
+import { logger } from './logger';
+
+/** Single-writer lock stored in MongoDB (works on Atlas/Render, no Redis needed). */
+const Lease = mongoose.model('Lease', new mongoose.Schema({ _id: String, owner: String, expiresAt: Date }, { versionKey: false }));
+const TTL = 20_000;
+const id = 'game-engine';
+export const instanceId = randomUUID();
+
+const tryAcquire = async () => {
+  const now = new Date();
+  try {
+    await Lease.findOneAndUpdate({ _id: id, $or: [{ owner: instanceId }, { expiresAt: { $lt: now } }] }, { $set: { owner: instanceId, expiresAt: new Date(now.getTime() + TTL) } }, { upsert: true });
+    return true;
+  } catch (e: any) { if (e?.code === 11000) return false; throw e; } // someone else holds a live lease
+};
+
+/** Waits (during a rolling deploy the old instance releases on SIGTERM) then keeps renewing; exits the process if the lease is lost. */
+export async function acquireEngineLease(waitMs = 60_000) {
+  const deadline = Date.now() + waitMs;
+  while (!(await tryAcquire())) {
+    if (Date.now() > deadline) throw new Error('Another game engine holds the lease. Run exactly one instance.');
+    logger.warn('waiting for the previous engine instance to release the lease...');
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  setInterval(async () => {
+    try { if (!(await tryAcquire())) throw new Error('lost'); }
+    catch { logger.fatal('lost the engine lease - exiting so only one engine runs'); process.exit(1); }
+  }, 5000).unref();
+}
+export const releaseEngineLease = () => Lease.deleteOne({ _id: id, owner: instanceId }).catch(() => undefined);

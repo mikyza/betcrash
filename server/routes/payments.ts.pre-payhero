@@ -1,0 +1,119 @@
+import { Router, type NextFunction, type Request, type Response } from 'express';
+import { createHmac, timingSafeEqual } from 'crypto';
+import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
+import { env } from '../env';
+import { logger } from '../logger';
+import { AppError, toMajor, toMinor } from '../money';
+import { Payment, Transaction, User, Withdrawal } from '../models';
+import { AuthedRequest, requireAuth } from '../auth';
+import { credit, debit, inTransaction } from '../wallet';
+import { LIMITS, WITHDRAWAL_METHODS } from '../limits';
+
+const ok = (res: Response, data: unknown, status = 200) => res.status(status).json({ success: true, data });
+const wrap = (fn: (req: AuthedRequest, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => fn(req as AuthedRequest, res).catch(next);
+const safeEqual = (a: string, b: string) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); };
+const hmac = (secret: string, data: string | Buffer) => createHmac('sha256', secret).update(data).digest('hex');
+const money = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const parse = <T extends z.ZodTypeAny>(schema: T, v: unknown): z.infer<T> => {
+  const r = schema.safeParse(v);
+  if (!r.success) throw new AppError(r.error.issues[0]?.message ?? 'Invalid input', 422);
+  return r.data;
+};
+
+const depositSchema = z.object({
+  amount: z.number().finite().min(LIMITS.MIN_DEPOSIT, `Minimum deposit is ${LIMITS.MIN_DEPOSIT}`).max(LIMITS.MAX_DEPOSIT, `Maximum deposit is ${LIMITS.MAX_DEPOSIT}`),
+  provider: z.literal('razorpay'),
+});
+const withdrawSchema = z.object({
+  amount: z.number().finite().min(LIMITS.MIN_WITHDRAWAL, `Minimum withdrawal is ${LIMITS.MIN_WITHDRAWAL}`).max(LIMITS.MAX_WITHDRAWAL, `Maximum withdrawal is ${LIMITS.MAX_WITHDRAWAL}`),
+  method: z.string().refine((m) => (WITHDRAWAL_METHODS as readonly string[]).includes(m), 'Choose a withdrawal method'),
+  accountDetails: z.string().trim().min(4, 'Enter your account details').max(200, 'Account details are too long'),
+});
+
+/** Idempotent: safe to call from both the browser verify call and the webhook; money is credited once. */
+async function settleDeposit(orderId: string, paymentId: string) {
+  return inTransaction(async (s) => {
+    const p = await Payment.findOneAndUpdate({ orderId, status: 'created' }, { status: 'paid', paymentId }, { new: true, session: s });
+    if (!p) { const done = await Payment.findOne({ orderId }).session(s); if (done?.status === 'paid') return { balance: (await User.findById(done.user).session(s))!.balance, already: true }; throw new AppError('Unknown order', 404); }
+    const balance = await credit(s, p.user, p.amount, 'deposit', paymentId, { orderId });
+    await User.updateOne({ _id: p.user }, { $inc: { totalDeposits: p.amount } }, { session: s });
+    return { balance, already: false };
+  });
+}
+
+export const paymentsRouter = Router();
+
+paymentsRouter.post('/deposit', requireAuth, money, wrap(async (req, res) => {
+  if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) throw new AppError('Payments are not configured', 503);
+  const b = parse(depositSchema, req.body);
+  const user = await User.findById(req.auth!.id);
+  if (!user || user.status !== 'active') throw new AppError('Account unavailable', 403);
+  const amount = toMinor(b.amount);
+  const r = await fetch('https://api.razorpay.com/v1/orders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + Buffer.from(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`).toString('base64') },
+    body: JSON.stringify({ amount, currency: user.currency, receipt: `dep_${Date.now()}_${String(user._id).slice(-6)}` }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!r.ok) { logger.error({ status: r.status }, 'razorpay order failed'); throw new AppError('Could not start payment', 502); }
+  const order = (await r.json()) as { id: string };
+  const p = await Payment.create({ user: user._id, provider: 'razorpay', orderId: order.id, amount, currency: user.currency });
+  ok(res, { orderId: order.id, amount, currency: user.currency, keyId: env.RAZORPAY_KEY_ID, transactionId: String(p._id) });
+}));
+
+paymentsRouter.post('/razorpay/verify', requireAuth, wrap(async (req, res) => {
+  const b = z.object({ orderId: z.string(), paymentId: z.string(), signature: z.string() }).safeParse(req.body);
+  if (!b.success || !env.RAZORPAY_KEY_SECRET) throw new AppError('Invalid payment data', 422);
+  if (!safeEqual(hmac(env.RAZORPAY_KEY_SECRET, `${b.data.orderId}|${b.data.paymentId}`), b.data.signature)) throw new AppError('Payment signature mismatch', 400);
+  const owns = await Payment.exists({ orderId: b.data.orderId, user: req.auth!.id });
+  if (!owns) throw new AppError('Unknown order', 404);
+  const { balance } = await settleDeposit(b.data.orderId, b.data.paymentId);
+  ok(res, { balance: toMajor(balance) });
+}));
+
+/** Mounted with express.raw() in server.ts so the signature is computed over the exact bytes Razorpay sent. */
+export const razorpayWebhook = async (req: Request, res: Response) => {
+  try {
+    const secret = env.RAZORPAY_WEBHOOK_SECRET;
+    const sig = String(req.headers['x-razorpay-signature'] ?? '');
+    if (!secret || !Buffer.isBuffer(req.body) || !safeEqual(hmac(secret, req.body), sig)) return res.status(400).end();
+    const evt = JSON.parse(req.body.toString('utf8'));
+    if (evt.event === 'payment.captured' || evt.event === 'order.paid') {
+      const pay = evt.payload?.payment?.entity;
+      if (pay?.order_id && pay?.id) await settleDeposit(pay.order_id, pay.id);
+    }
+    res.status(200).json({ received: true });
+  } catch (err) { logger.error({ err }, 'razorpay webhook error'); res.status(500).end(); }
+};
+
+paymentsRouter.post('/withdraw', requireAuth, money, wrap(async (req, res) => {
+  const b = parse(withdrawSchema, req.body);
+  const user = await User.findById(req.auth!.id).select('currency status');
+  if (!user || user.status !== 'active') throw new AppError('Account unavailable', 403);
+  const pending = await Withdrawal.countDocuments({ user: user._id, status: 'pending' });
+  if (pending >= LIMITS.MAX_PENDING_WITHDRAWALS) throw new AppError('You already have pending withdrawals. Wait for them to be processed first.', 409);
+  const minor = toMinor(b.amount);
+  const out = await inTransaction(async (s) => {
+    const [w] = await Withdrawal.create([{ user: user._id, amount: minor, currency: user.currency, method: b.method, accountDetails: b.accountDetails }], { session: s });
+    const balance = await debit(s, user._id, minor, 'withdrawal', String(w._id)); // funds held immediately; throws 'Insufficient balance'
+    return { id: String(w._id), balance };
+  });
+  ok(res, { id: out.id, status: 'pending', balance: toMajor(out.balance) }, 201);
+}));
+
+// ---- read endpoints for the wallet window ----
+/** Public: the frontend reads the min/max from here so the UI always matches what the server enforces. */
+paymentsRouter.get('/limits', (_req, res) => ok(res, LIMITS));
+
+const WALLET_TYPES = ['deposit', 'withdrawal', 'withdrawal_refund', 'adjustment'];
+paymentsRouter.get('/transactions', requireAuth, wrap(async (req, res) => {
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 30));
+  const rows = await Transaction.find({ user: req.auth!.id, type: { $in: WALLET_TYPES } }).sort({ createdAt: -1 }).limit(limit);
+  ok(res, rows.map((t) => ({ id: String(t._id), type: t.type, amount: toMajor(t.amount), balanceAfter: toMajor(t.balanceAfter), currency: t.currency, createdAt: t.createdAt })));
+}));
+
+paymentsRouter.get('/withdrawals', requireAuth, wrap(async (req, res) => {
+  const rows = await Withdrawal.find({ user: req.auth!.id }).sort({ createdAt: -1 }).limit(20);
+  ok(res, rows.map((w) => ({ id: String(w._id), amount: toMajor(w.amount), currency: w.currency, method: w.method, status: w.status, adminNote: w.adminNote ?? '', createdAt: w.createdAt, processedAt: w.processedAt })));
+}));

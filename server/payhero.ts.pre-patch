@@ -1,0 +1,66 @@
+import { env } from './env';
+import { AppError } from './money';
+import { logger } from './logger';
+
+const BASE = 'https://backend.payhero.co.ke/api/v2';
+const authHeader = () => 'Basic ' + Buffer.from(`${env.PAYHERO_API_USERNAME}:${env.PAYHERO_API_PASSWORD}`).toString('base64');
+
+/** Normalise Kenyan numbers (07xx, 01xx, +254..., 254...) to 2547XXXXXXXX / 2541XXXXXXXX. Returns null if invalid. */
+export function normalizePhone(input: string): string | null {
+  const d = String(input).replace(/[\s\-()+]/g, '');
+  const m = d.match(/^(?:254|0)?([17]\d{8})$/);
+  return m ? `254${m[1]}` : null;
+}
+
+async function call(method: 'GET' | 'POST', path: string, body?: object) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', Authorization: authHeader() },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  let json: any = {};
+  try { json = JSON.parse(text); } catch { /* keep {} */ }
+  return { ok: res.ok, status: res.status, json };
+}
+
+export const callbackUrl = (kind: 'deposit' | 'withdraw') =>
+  `${env.PUBLIC_ORIGIN}/api/v1/payments/payhero/${kind}-callback/${env.PAYHERO_CALLBACK_SECRET}`;
+
+/** C2B: push an M-Pesa STK prompt to the customer's phone. */
+export async function stkPush(p: { amount: number; phone: string; externalReference: string; customerName: string }) {
+  const r = await call('POST', '/payments', {
+    amount: Math.round(p.amount), phone_number: p.phone, channel_id: env.PAYHERO_CHANNEL_ID, provider: 'm-pesa',
+    external_reference: p.externalReference, customer_name: p.customerName, callback_url: callbackUrl('deposit'),
+  });
+  if (!r.ok || r.json?.success === false) { logger.error({ status: r.status, body: r.json }, 'payhero stk push failed'); throw new AppError('Could not send the M-Pesa prompt. Try again.', 502); }
+  return { reference: r.json.reference as string | undefined, checkoutRequestId: r.json.CheckoutRequestID as string | undefined };
+}
+
+/** B2C: send money from the PayHero payments wallet to a customer's M-Pesa. */
+export async function b2cPayout(p: { amount: number; phone: string; externalReference: string }) {
+  const r = await call('POST', '/withdraw', {
+    external_reference: p.externalReference, amount: Math.round(p.amount), phone_number: p.phone, network_code: '63902',
+    callback_url: callbackUrl('withdraw'), channel: 'mobile', channel_id: env.PAYHERO_PAYOUT_CHANNEL_ID ?? env.PAYHERO_CHANNEL_ID, payment_service: 'b2c',
+  });
+  if (!r.ok || r.json?.success === false) { logger.error({ status: r.status, body: r.json }, 'payhero b2c failed'); throw new AppError(`PayHero rejected the payout (${r.json?.error_message || r.json?.message || r.status})`, 502); }
+  return { reference: (r.json.reference ?? r.json.id) as string | undefined };
+}
+
+/**
+ * Callbacks are NOT signed by PayHero, so before crediting money we ask PayHero directly (authenticated) what happened.
+ * Returns 'success' | 'failed' | 'unknown' (could not determine - caller must NOT credit).
+ */
+export async function verifyTransaction(payheroReference?: string | null): Promise<'success' | 'failed' | 'unknown'> {
+  if (!env.PAYHERO_VERIFY_WITH_API) return 'success';
+  if (!payheroReference) return 'unknown';
+  try {
+    const r = await call('GET', `/transaction-status?reference=${encodeURIComponent(payheroReference)}`);
+    if (!r.ok) return 'unknown';
+    const st = String(r.json?.status ?? r.json?.Status ?? r.json?.transaction_status ?? '').toUpperCase();
+    if (['SUCCESS', 'SUCCESSFUL', 'COMPLETED', 'PAID'].includes(st)) return 'success';
+    if (['FAILED', 'CANCELLED', 'CANCELED', 'REJECTED', 'TIMEOUT'].includes(st)) return 'failed';
+    return 'unknown';
+  } catch (err) { logger.warn({ err }, 'transaction-status lookup failed'); return 'unknown'; }
+}

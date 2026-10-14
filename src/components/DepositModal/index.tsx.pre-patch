@@ -1,0 +1,8 @@
+"use client";
+import React from "react";
+import WalletModal from "../Wallet";
+
+/** Kept so existing imports keep working. Deposit, withdraw and history now live in the Wallet window. */
+export default function DepositModal({ onClose }: { onClose: () => void }) {
+  return <WalletModal initialTab="deposit" onClose={onClose} />;
+}

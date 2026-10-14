@@ -1,0 +1,82 @@
+"use client";
+import React from "react";
+
+import SettingsMenu from "./SettingsMenu";
+import WalletModal, { type WalletTab } from "../Wallet";
+import { Context } from "@/context";
+import { TOKEN_KEY } from "../utils/api";
+
+// Image moved to public/images/logo.svg
+import "./header.scss";
+
+export default function Header() {
+  const { userInfo, msgTab, isAuthenticated, logout } = React.useContext(Context);
+  const [wallet, setWallet] = React.useState<WalletTab | null>(null);
+  const [signingOut, setSigningOut] = React.useState(false);
+
+  // SettingsMenu still receives this; the how-to dialogs were switched off in the old header and are not rendered here.
+  const [, setHowto] = React.useState<"howto" | "short" | "more" | "">("howto");
+
+  const handleSignOut = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await logout();
+    } catch {
+      /* fall through: always end the local session */
+    } finally {
+      // if the context left a token behind (e.g. the server was unreachable), remove it and restart cleanly
+      if (typeof window !== "undefined" && localStorage.getItem(TOKEN_KEY)) {
+        localStorage.removeItem(TOKEN_KEY);
+        window.location.reload();
+      }
+      setSigningOut(false);
+    }
+  };
+
+  return (
+    <div className={`header flex-none items-center ${msgTab && "chat-size"}`}>
+      <div className="header-container">
+        <div className="header-first">
+          <div className="logo-container">
+            <img src="/images/logo.svg" alt="Aviator" className="logo" />
+          </div>
+        </div>
+
+        <div className="second-block">
+          <div className="d-flex">
+            <div className="balance" aria-label="Your balance">
+              <span className="amount">{Number(userInfo.balance).toFixed(2)} </span>
+              <span className="currency">&nbsp;{userInfo?.currency ? userInfo.currency : "INR"}</span>
+            </div>
+
+            {isAuthenticated && (
+              <div className="hdr-actions">
+                <button type="button" className="hdr-btn hdr-btn--deposit" onClick={() => setWallet("deposit")} title="Deposit">
+                  <span className="hdr-btn__icon" aria-hidden="true">+</span>
+                  <span className="hdr-btn__text">Deposit</span>
+                </button>
+                <button type="button" className="hdr-btn hdr-btn--withdraw" onClick={() => setWallet("withdraw")} title="Withdraw">
+                  <span className="hdr-btn__icon" aria-hidden="true">↗</span>
+                  <span className="hdr-btn__text">Withdraw</span>
+                </button>
+              </div>
+            )}
+
+            <div>
+              <SettingsMenu setHowto={setHowto} />
+            </div>
+
+            {isAuthenticated && (
+              <button type="button" className="hdr-signout" onClick={handleSignOut} disabled={signingOut} title="Sign out">
+                <span className="hdr-signout__icon" aria-hidden="true">⏻</span>
+                <span className="hdr-signout__text">{signingOut ? "Signing out…" : "Sign out"}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      {wallet && <WalletModal initialTab={wallet} onClose={() => setWallet(null)} />}
+    </div>
+  );
+}

@@ -1,0 +1,61 @@
+import mongoose, { ClientSession } from 'mongoose';
+import { Transaction, User } from './models';
+import { AppError } from './money';
+
+type TxType = 'deposit' | 'withdrawal' | 'withdrawal_refund' | 'bet' | 'win' | 'bet_refund' | 'adjustment';
+
+/** server.ts sets hooks.onBalance to push live balance updates over socket.io. */
+export const hooks: { onBalance?: (userId: string, minor: number) => void } = {};
+
+// Balance changes made inside a transaction are queued here and only announced after it commits.
+const pending = new WeakMap<ClientSession, Array<[string, number]>>();
+
+function notify(s: ClientSession, userId: string, balance: number) {
+  const queue = pending.get(s);
+  if (queue) queue.push([userId, balance]);
+  else hooks.onBalance?.(userId, balance); // session not managed by inTransaction: fires immediately
+}
+
+/** Run fn inside a Mongo transaction (auto-retries transient errors). */
+export const inTransaction = async <T>(fn: (s: ClientSession) => Promise<T>): Promise<T> => {
+  const session = await mongoose.startSession();
+  const queue: Array<[string, number]> = [];
+  pending.set(session, queue);
+  try {
+    let out!: T;
+    await session.withTransaction(async () => {
+      queue.length = 0; // a retried attempt starts clean
+      out = await fn(session);
+    });
+    for (const [id, bal] of queue) {
+      try { hooks.onBalance?.(id, bal); } catch { /* a socket error must never fail a committed payment */ }
+    }
+    return out;
+  } finally {
+    await session.endSession();
+  }
+};
+
+/** Atomically debit; fails (never goes negative) if funds are insufficient or the user is banned. */
+export async function debit(s: ClientSession, userId: string | mongoose.Types.ObjectId, minor: number, type: TxType, ref?: string, meta?: object) {
+  if (!Number.isInteger(minor) || minor <= 0) throw new AppError('Invalid amount');
+  const u = await User.findOneAndUpdate(
+    { _id: userId, status: 'active', balance: { $gte: minor } },
+    { $inc: { balance: -minor } },
+    { new: true, session: s },
+  );
+  if (!u) throw new AppError('Insufficient balance');
+  await Transaction.create([{ user: u._id, type, amount: -minor, balanceAfter: u.balance, currency: u.currency, ref, meta }], { session: s });
+  notify(s, String(u._id), u.balance);
+  return u.balance;
+}
+
+/** Atomically credit. `ref`+`type` is unique, so replaying the same payout/deposit is a no-op error, not a double credit. */
+export async function credit(s: ClientSession, userId: string | mongoose.Types.ObjectId, minor: number, type: TxType, ref?: string, meta?: object) {
+  if (!Number.isInteger(minor) || minor < 0) throw new AppError('Invalid amount');
+  const u = await User.findOneAndUpdate({ _id: userId }, { $inc: { balance: minor } }, { new: true, session: s });
+  if (!u) throw new AppError('User not found', 404);
+  await Transaction.create([{ user: u._id, type, amount: minor, balanceAfter: u.balance, currency: u.currency, ref, meta }], { session: s });
+  notify(s, String(u._id), u.balance);
+  return u.balance;
+}
